@@ -147,12 +147,16 @@ class WorkflowExecutionEngine:
             (node.data.get('tool_type') == 'MCP_TOOL' or node.data.get('toolType') == 'MCP_TOOL')
         ]
 
-        # Load tools for each MCP node asynchronously
+        # Load tools for each MCP node asynchronously with error handling
         for node in mcp_tool_nodes:
-            template = MCPToolTemplate(node, workflow)
-            tools = await template.list_mcp_tools()
-            context.set_loaded_tools(node.id, tools)
-            logger.info(f"Pre-loaded {len(tools)} MCP tools for node {node.id}")
+            try:
+                template = MCPToolTemplate(node, workflow)
+                tools = await template.list_mcp_tools()
+                context.set_loaded_tools(node.id, tools)
+                logger.info(f"Pre-loaded {len(tools)} MCP tools for node {node.id}")
+            except Exception as e:
+                logger.error(f"Failed to pre-load MCP tools for node {node.id}: {e}", exc_info=True)
+                context.set_loaded_tools(node.id, [])
 
 
 # Global execution engine instance

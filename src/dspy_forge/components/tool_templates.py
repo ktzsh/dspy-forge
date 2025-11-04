@@ -64,14 +64,16 @@ class MCPToolTemplate(BaseToolTemplate):
             'mcp_headers': self.node_data.get('mcp_headers') or self.node_data.get('mcpHeaders', []),
         }
     
+    @staticmethod
     def convert_mcp_tool(client_info: Dict[str, Any], tool: "mcp.types.Tool") -> Tool:
+        """Convert an MCP tool to DSPy Tool format"""
         args, arg_types, arg_desc = convert_input_schema_to_tool_args(tool.inputSchema)
 
         # Convert the MCP tool and Session to a single async method
         async def func(*args, **kwargs):
             async with streamablehttp_client(
                 url=client_info["url"],
-                headers=client_info["hea"]
+                headers=client_info["headers"]
             ) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -108,27 +110,36 @@ class MCPToolTemplate(BaseToolTemplate):
 
             if is_secret and env_var_name:
                 # Use environment variable
-                headers[key] = os.getenv(env_var_name)
+                env_value = os.getenv(env_var_name)
+                if env_value:
+                    headers[key] = env_value
+                else:
+                    logger.warning(f"Environment variable {env_var_name} not found for header {key}")
             else:
                 # Use literal value
                 headers[key] = value
 
         tools = []
-        async with streamablehttp_client(
-            url=mcp_url,
-            headers=headers
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tool_list = await session.list_tools()
+        try:
+            async with streamablehttp_client(
+                url=mcp_url,
+                headers=headers
+            ) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tool_list = await session.list_tools()
 
-                # Convert MCP tools to DSPy tools
-                tools = [
-                    self.convert_mcp_tool(
-                        {"url": mcp_url, "headers": headers}, tool
-                    ) for tool in tool_list.tools
-                ]
-        logger.info(f"Loaded {len(tools)} tools from MCP server: {mcp_url}")
+                    # Convert MCP tools to DSPy tools
+                    tools = [
+                        MCPToolTemplate.convert_mcp_tool(
+                            {"url": mcp_url, "headers": headers}, tool
+                        ) for tool in tool_list.tools
+                    ]
+            logger.info(f"Loaded {len(tools)} tools from MCP server: {mcp_url}")
+        except Exception as e:
+            logger.error(f"Failed to load MCP tools from {mcp_url}: {e}", exc_info=True)
+            return []
+        
         return tools
 
     def load_tools(self, context=None) -> list:
@@ -220,7 +231,7 @@ class UCFunctionTemplate(BaseToolTemplate):
 
     def load_tools(self, context=None) -> list:
         """Load Unity Catalog function tools synchronously"""
-        import dspy
+        from dspy.adapters.types.tool import Tool as DSPyTool
 
         # Get configuration
         catalog = self.node_data.get('catalog', '')
@@ -235,23 +246,40 @@ class UCFunctionTemplate(BaseToolTemplate):
             logger.error(f"UC Function tool missing required fields: catalog={catalog}, schema={schema}, function_name={function_name}")
             return []
 
-        client = DatabricksFunctionClient()
-        set_uc_function_client(client)
+        try:
+            # Initialize UC function client
+            client = DatabricksFunctionClient()
+            set_uc_function_client(client)
 
-        # Create DSPy tool from UC function
-        def uc_function_wrapper(**kwargs):
-            """Wrapper to execute UC function"""
-            return client.execute_function(full_func_name, kwargs)
+            # Get function metadata to create proper tool signature
+            # The client provides function information including parameters
+            
+            # Create DSPy tool from UC function
+            def uc_function_wrapper(**kwargs):
+                """Wrapper to execute UC function"""
+                try:
+                    result = client.execute_function(full_func_name, kwargs)
+                    return result
+                except Exception as e:
+                    logger.error(f"Error executing UC function {full_func_name}: {e}", exc_info=True)
+                    raise
 
-        tool = dspy.Tool(
-            name=tool_name or function_name,
-            description=description or f"Unity Catalog function: {full_func_name}",
-            func=uc_function_wrapper
-        )
-        tools = [tool]
-        logger.info(f"Loaded UC function: {full_func_name}")
+            # Create tool with proper metadata
+            tool = DSPyTool(
+                func=uc_function_wrapper,
+                name=tool_name or function_name,
+                desc=description or f"Unity Catalog function: {full_func_name}",
+                args={},  # Will be populated from function metadata
+                arg_types={},
+                arg_desc={}
+            )
+            tools = [tool]
+            logger.info(f"Loaded UC function: {full_func_name}")
+            return tools
 
-        return tools
+        except Exception as e:
+            logger.error(f"Failed to load UC function {full_func_name}: {e}", exc_info=True)
+            return []
 
     def generate_tool_loading_method(self, var_prefix: str) -> str:
         """Generate code for UC function client initialization"""
@@ -259,6 +287,7 @@ class UCFunctionTemplate(BaseToolTemplate):
         catalog = tool_config['catalog']
         schema = tool_config['schema']
         function_name = tool_config['function_name']
+        tool_name = tool_config['tool_name']
         full_func_name = f"{catalog}.{schema}.{function_name}"
 
         # Generate UC function loading code
@@ -267,19 +296,30 @@ class UCFunctionTemplate(BaseToolTemplate):
         """Load Unity Catalog function: {full_func_name}"""
         from unitycatalog.ai.core.base import set_uc_function_client
         from unitycatalog.ai.core.databricks import DatabricksFunctionClient
+        from dspy.adapters.types.tool import Tool
 
         tools = []
         try:
             client = DatabricksFunctionClient()
             set_uc_function_client(client)
 
+            # Create wrapper function for UC function execution
+            def uc_function_wrapper(**kwargs):
+                try:
+                    result = client.execute_function("{full_func_name}", kwargs)
+                    return result
+                except Exception as e:
+                    logger.error(f"Error executing UC function {full_func_name}: {{e}}")
+                    raise
+
             # Create DSPy tool from UC function
-            # Note: Actual implementation depends on DSPy's UC function support
-            # This is a placeholder that should be adapted based on DSPy's API
-            tool = dspy.Tool(
-                name="{function_name}",
-                description="{tool_config['description']}",
-                func=lambda **kwargs: client.execute_function("{full_func_name}", kwargs)
+            tool = Tool(
+                func=uc_function_wrapper,
+                name="{tool_name or function_name}",
+                desc="{tool_config['description'] or f'Unity Catalog function: {full_func_name}'}",
+                args={{}},
+                arg_types={{}},
+                arg_desc={{}}
             )
             tools.append(tool)
             logger.info(f"Loaded UC function: {full_func_name}")
